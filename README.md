@@ -6,7 +6,7 @@ This solution does NOT track Lambda@Edge total cost because you will need to agg
 
 ## Solution Architecture
 
-![CloudFront Charge-Back Logging Architecture](images/cloudfront-charge-back-architecture-diagram.png)
+![CloudFront Charge-Back Logging Architecture](images/cloudfront-charge-back-logging-architecture-diagram.png)
 
 ## Requirements
 
