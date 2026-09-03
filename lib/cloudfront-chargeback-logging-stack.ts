@@ -21,6 +21,8 @@ import * as origins from 'aws-cdk-lib/aws-cloudfront-origins';
 import * as waf from 'aws-cdk-lib/aws-wafv2';
 import * as s3deploy from 'aws-cdk-lib/aws-s3-deployment';
 
+import { suppress, suppressByPath } from './nag-suppressions';
+
 export class CloudfrontChargeBackLoggingStack extends Stack {
   public readonly logLandingBucket: s3.Bucket;
 
@@ -409,8 +411,165 @@ export class CloudfrontChargeBackLoggingStack extends Stack {
       },    
     });
 
-    new CfnOutput(this, 'cloudFrontUrl', { 
-      value: chargeBackdistribution.distributionDomainName 
+    // Pricing fact tables — replace the chargeback query's inline CASE/hardcoded pricing with two
+    // version-able Glue EXTERNAL tables it JOINs against (edge-prefix->region, and per-region
+    // prices). Re-price/add an edge = CSV edit + `cdk deploy`, no query rewrite. Backing CSVs ship
+    // from pricing-data/ to s3://<logLandingBucket>/pricing/ (see deploy-pricing-data below); read
+    // with LazySimpleSerDe (field.delim ',') + skip.header.line.count '1'.
+
+    const pricingPrefix = 'pricing';
+
+    // IATA edge-location prefix -> region_key mapping. One row per prefix in the old CASE map.
+    const edgeLocationRegionTable = new glue.CfnTable(this, 'edge-location-region-glue-table', {
+      catalogId: Stack.of(this).account,
+      databaseName: glueDatabase.databaseName,
+      tableInput: {
+        name: 'cf_edge_location_region',
+        description: 'Maps CloudFront edge IATA prefix (SUBSTRING(x_edge_location,1,3)) to a pricing region_key',
+        tableType: 'EXTERNAL_TABLE',
+        parameters: {
+          'EXTERNAL': 'TRUE',
+          'skip.header.line.count': '1',
+        },
+        storageDescriptor: {
+          columns: [
+            { name: 'iata_prefix', type: 'string' },
+            { name: 'region_key', type: 'string' },
+          ],
+          location: `s3://${logLandingBucket.bucketName}/${pricingPrefix}/edge-location-region/`,
+          inputFormat: 'org.apache.hadoop.mapred.TextInputFormat',
+          outputFormat: 'org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat',
+          serdeInfo: {
+            serializationLibrary: 'org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe',
+            parameters: {
+              'field.delim': ',',
+              'serialization.format': ',',
+              'skip.header.line.count': '1',
+            },
+          },
+        },
+      },
+    });
+
+    // Per-region price facts. One row per pricing region plus a 'default' fallback row.
+    const regionPricingTable = new glue.CfnTable(this, 'region-pricing-glue-table', {
+      catalogId: Stack.of(this).account,
+      databaseName: glueDatabase.databaseName,
+      tableInput: {
+        name: 'cf_region_pricing',
+        description: 'Per-region CloudFront price facts (DTO $/GB, request $/10k) — version-able pricing data',
+        tableType: 'EXTERNAL_TABLE',
+        parameters: {
+          'EXTERNAL': 'TRUE',
+          'skip.header.line.count': '1',
+        },
+        storageDescriptor: {
+          columns: [
+            { name: 'region_key', type: 'string' },
+            { name: 'region_name', type: 'string' },
+            { name: 'dto_price_per_gb', type: 'double' },
+            { name: 'request_price_per_10k', type: 'double' },
+            { name: 'tier', type: 'string' }, // 'first' today; future tiered pricing is a data add
+          ],
+          location: `s3://${logLandingBucket.bucketName}/${pricingPrefix}/region-pricing/`,
+          inputFormat: 'org.apache.hadoop.mapred.TextInputFormat',
+          outputFormat: 'org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat',
+          serdeInfo: {
+            serializationLibrary: 'org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe',
+            parameters: {
+              'field.delim': ',',
+              'serialization.format': ',',
+              'skip.header.line.count': '1',
+            },
+          },
+        },
+      },
+    });
+
+    // Deploy the pricing CSVs to s3://<logLandingBucket>/pricing/. The repo dir `pricing-data/`
+    // mirrors the S3 layout — each CSV under its own per-table subdir — and BucketDeployment
+    // preserves that tree, so each Glue table's `location` points at a dir holding exactly one
+    // CSV. prune:false so the CloudFront logs already in this bucket are never deleted.
+    new s3deploy.BucketDeployment(this, 'deploy-pricing-data', {
+      sources: [s3deploy.Source.asset(path.join(__dirname, '../pricing-data'))],
+      destinationBucket: logLandingBucket,
+      destinationKeyPrefix: pricingPrefix,
+      prune: false,
+    });
+
+    // cdk-nag suppressions — demo/sample stack. Findings are pre-existing sample characteristics
+    // or framework-generated (BucketDeployment handler); each waiver is resource-scoped with a
+    // justification below.
+    const s1 = {
+      id: 'AwsSolutions-S1',
+      reason: 'Demo/sample stack; the CloudFront-logs and WAF-logs buckets are themselves log sinks and the SPA bucket serves static demo content — S3 server-access logging is out of scope for the sample and would add a recursive log bucket.',
+    };
+    suppress(logLandingBucket, [s1]);
+    suppress(waflogLandingBucket, [s1]);
+    suppress(spaBucket, [s1]);
+
+    suppress(chargeBackdistribution, [
+      {
+        id: 'AwsSolutions-CFR7',
+        reason: 'Demo stack intentionally uses the legacy S3 OriginAccessIdentity pattern; migration to Origin Access Control is out of scope for this change and does not affect chargeback logging.',
+      },
+      {
+        id: 'AwsSolutions-CFR4',
+        reason: 'Distribution uses the default *.cloudfront.net certificate, which forces the TLSv1 security policy and ignores minimumProtocolVersion; enforcing TLS 1.2 requires a custom domain + ACM certificate, which is out of scope for this demo stack.',
+      },
+      {
+        id: 'AwsSolutions-CFR1',
+        reason: 'Demo chargeback distribution is intentionally globally reachable to exercise multi-region edge traffic; geo restrictions would defeat the purpose of the sample and are a per-deployment policy choice for the adopter.',
+      },
+    ]);
+
+    const iam4BasicExec = {
+      id: 'AwsSolutions-IAM4',
+      reason: 'AWS-managed AWSLambdaBasicExecutionRole grants only CloudWatch Logs write, which is the least privilege needed for the function to log; it is the CDK default for Lambda execution roles.',
+      appliesTo: ['Policy::arn:<AWS::Partition>:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'],
+    };
+    suppress(chargeBackLambda, [iam4BasicExec], true);
+    suppress(lambdaEdgeFunction, [iam4BasicExec], true);
+
+    suppress(
+      chargeBackAPI,
+      [
+        { id: 'AwsSolutions-APIG1', reason: 'Demo REST API serving sample dynamic content behind CloudFront; stage access logging is out of scope for this sample stack.' },
+        { id: 'AwsSolutions-APIG2', reason: 'Demo REST API with a proxy integration to a sample Lambda; request validation is out of scope for this sample stack.' },
+        { id: 'AwsSolutions-APIG4', reason: 'Demo REST API endpoint intentionally left unauthenticated to serve public sample content behind CloudFront; auth is out of scope for this sample.' },
+        { id: 'AwsSolutions-APIG6', reason: 'Demo REST API serving sample content; per-method CloudWatch execution logging is out of scope for this sample stack.' },
+        { id: 'AwsSolutions-COG4', reason: 'Demo REST API endpoint intentionally has no Cognito user pool authorizer; it serves public sample content behind CloudFront.' },
+        { id: 'AwsSolutions-APIG3', reason: 'The demo distribution is protected by an AWS WAF WebACL at the CloudFront edge; a separate WAFv2 association on the regional API Gateway stage is redundant for this sample and out of scope.' },
+      ],
+      true, // findings land on stage + method child resources
+    );
+
+    // Framework-generated BucketDeployment copy handler. Path uses this.node.id (not a hardcoded
+    // stack name) so it resolves under any stack id, e.g. the jest test's 'MyTestStack'.
+    const bucketDeploymentPath =
+      `/${this.node.id}/Custom::CDKBucketDeployment8693BB64968944B69AAFB0CC9EB8756C`;
+    suppressByPath(this, `${bucketDeploymentPath}/Resource`, [
+      {
+        id: 'AwsSolutions-L1',
+        reason: 'CDK-synthesized BucketDeployment asset-copy Lambda; its runtime is pinned by the aws-cdk-lib version and is not selectable by this application, so the latest-runtime rule is not actionable here.',
+      },
+    ]);
+    suppressByPath(this, `${bucketDeploymentPath}/ServiceRole/Resource`, [
+      {
+        id: 'AwsSolutions-IAM4',
+        reason: 'CDK-synthesized BucketDeployment copy handler role; the AWS-managed AWSLambdaBasicExecutionRole is attached by the framework and grants only CloudWatch Logs write — not under application control.',
+        appliesTo: ['Policy::arn:<AWS::Partition>:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'],
+      },
+    ]);
+    suppressByPath(this, `${bucketDeploymentPath}/ServiceRole/DefaultPolicy/Resource`, [
+      {
+        id: 'AwsSolutions-IAM5',
+        reason: 'CDK-synthesized BucketDeployment copy handler; its wildcard S3 read/list/write actions, the CDK asset bucket + destination bucket resource wildcards, and the CloudFront invalidation permission are generated by the framework to sync assets and invalidate the distribution — not under application control.',
+      },
+    ]);
+
+    new CfnOutput(this, 'cloudFrontUrl', {
+      value: chargeBackdistribution.distributionDomainName
     });
 
 }};

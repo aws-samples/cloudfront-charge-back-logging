@@ -8,6 +8,10 @@
 node_modules
 package-lock.json
 
+# Bun lockfile — this project uses npm
+bun.lock
+bun.lockb
+
 # File used to export stack's output values.
 cdk-outputs.json
 

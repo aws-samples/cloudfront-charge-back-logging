@@ -1,6 +1,6 @@
 *.ts
 !*.d.ts
-!cloudfront-charge-back-logging-stack.ts
+!cloudfront-chargeback-logging-stack.ts
 
 # CDK asset staging directory
 .cdk.staging

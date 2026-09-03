@@ -1,0 +1,13 @@
+region_key,region_name,dto_price_per_gb,request_price_per_10k,tier
+united-states,United States,0.085,0.0100,first
+mexico,Mexico,0.085,0.0100,first
+canada,Canada,0.085,0.0100,first
+europe,Europe,0.085,0.0120,first
+middle-east,Middle East,0.110,0.0120,first
+south-africa,South Africa,0.110,0.0120,first
+south-america,South America,0.110,0.0220,first
+japan,Japan,0.114,0.0120,first
+australia,Australia,0.114,0.0125,first
+asia,Asia,0.120,0.0120,first
+india,India,0.109,0.0120,first
+default,Unknown,0.110,0.0120,first
